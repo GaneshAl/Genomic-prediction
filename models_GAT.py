@@ -1,4 +1,7 @@
 # py_models/gat.py
+
+
+import os
 import sys
 import numpy as np
 import pandas as pd
@@ -33,82 +36,114 @@ class GATRegressor(nn.Module):
         return x
 
 
-def build_knn_edge_index(X, k=15):
-    # X: (n, p) numpy
+def build_knn_edge_index(X: np.ndarray, k: int = 15) -> torch.Tensor:
+    """Build an undirected KNN graph (k neighbors per node)."""
     n = X.shape[0]
     if n <= 1:
-        # degenerate
         return torch.empty((2, 0), dtype=torch.long)
 
     k = min(k, n - 1)
     nbrs = NearestNeighbors(n_neighbors=k + 1, metric="euclidean").fit(X)
     _, idx = nbrs.kneighbors(X)
 
-    # idx includes self at position 0, so skip it
     src = np.repeat(np.arange(n), k)
     dst = idx[:, 1:(k + 1)].reshape(-1)
 
-    # Make undirected edges by adding reverse
     edge = np.vstack([np.concatenate([src, dst]), np.concatenate([dst, src])])
     return torch.tensor(edge, dtype=torch.long)
 
 
-def main(train_path, test_path, out_path,
-         k=15, epochs=300, lr=1e-3, weight_decay=1e-4, seed=123):
-
-    np.random.seed(seed)
+def train_gat(data: Data,
+              train_mask: torch.Tensor,
+              epochs: int = 300,
+              lr: float = 1e-3,
+              weight_decay: float = 1e-4,
+              seed: int = 123) -> nn.Module:
     torch.manual_seed(seed)
-
-    train = pd.read_csv(train_path)
-    test  = pd.read_csv(test_path)
-
-    if "ID" not in train.columns or "y" not in train.columns:
-        raise ValueError("train.csv must contain columns: ID, y, <features.>")
-    if "ID" not in test.columns:
-        raise ValueError("test.csv must contain column: ID")
-
-    Xtr = train.drop(columns=["ID", "y"]).values
-    ytr = train["y"].values.astype(np.float32)
-
-    Xte = test.drop(columns=["ID"]).values
-
-    # strict: scaler fit on TRAIN only
-    scaler = StandardScaler(with_mean=True, with_std=True)
-    Xtr_s = scaler.fit_transform(Xtr).astype(np.float32)
-    Xte_s = scaler.transform(Xte).astype(np.float32)
-
-    # strict: graph built separately
-    edge_tr = build_knn_edge_index(Xtr_s, k=k)
-    edge_te = build_knn_edge_index(Xte_s, k=k)
-
-    data_tr = Data(
-        x=torch.tensor(Xtr_s, dtype=torch.float32),
-        edge_index=edge_tr,
-        y=torch.tensor(ytr, dtype=torch.float32)
-    )
-    data_te = Data(
-        x=torch.tensor(Xte_s, dtype=torch.float32),
-        edge_index=edge_te
-    )
+    np.random.seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data_tr = data_tr.to(device)
-    data_te = data_te.to(device)
+    data = data.to(device)
+    train_mask = train_mask.to(device)
 
-    model = GATRegressor(in_dim=data_tr.x.shape[1]).to(device)
+    model = GATRegressor(in_dim=data.x.shape[1]).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     for _ in range(epochs):
         model.train()
         opt.zero_grad()
-        pred = model(data_tr.x, data_tr.edge_index)
-        loss = F.mse_loss(pred, data_tr.y)
+        pred = model(data.x, data.edge_index)
+        loss = F.mse_loss(pred[train_mask], data.y[train_mask])
         loss.backward()
         opt.step()
 
-    model.eval()
-    with torch.no_grad():
-        pred_te = model(data_te.x, data_te.edge_index).detach().cpu().numpy()
+    return model.cpu()
+
+
+def main(train_path, test_path, out_path,
+         k=15, epochs=300, lr=1e-3, weight_decay=1e-4, seed=123):
+
+    graph_mode = os.environ.get("GRAPH_MODE", "transductive").strip().lower()
+
+    train = pd.read_csv(train_path)
+    test  = pd.read_csv(test_path)
+
+    if "ID" not in train.columns or "y" not in train.columns:
+        raise ValueError("train.csv must contain columns: ID, y, <features>")
+    if "ID" not in test.columns:
+        raise ValueError("test.csv must contain column: ID")
+
+    Xtr = train.drop(columns=["ID", "y"]).values
+    ytr = train["y"].values.astype(np.float32)
+    Xte = test.drop(columns=["ID"]).values
+
+    # scaler fit on TRAIN only (no leakage)
+    scaler = StandardScaler(with_mean=True, with_std=True)
+    Xtr_s = scaler.fit_transform(Xtr).astype(np.float32)
+    Xte_s = scaler.transform(Xte).astype(np.float32)
+
+    if graph_mode == "separate":
+        # Old behavior (ablation only): separate graphs for train and test
+        edge_tr = build_knn_edge_index(Xtr_s, k=k)
+        edge_te = build_knn_edge_index(Xte_s, k=k)
+
+        data_tr = Data(
+            x=torch.tensor(Xtr_s, dtype=torch.float32),
+            edge_index=edge_tr,
+            y=torch.tensor(ytr, dtype=torch.float32)
+        )
+        train_mask = torch.ones(data_tr.x.shape[0], dtype=torch.bool)
+        model = train_gat(data_tr, train_mask, epochs=epochs, lr=lr, weight_decay=weight_decay, seed=seed)
+
+        data_te = Data(
+            x=torch.tensor(Xte_s, dtype=torch.float32),
+            edge_index=edge_te,
+            y=torch.zeros(Xte_s.shape[0], dtype=torch.float32)
+        )
+        with torch.no_grad():
+            pred_te = model(data_te.x, data_te.edge_index).numpy()
+
+    else:
+        # Recommended: transductive graph on train+test nodes
+        X_all = np.vstack([Xtr_s, Xte_s])
+        edge_all = build_knn_edge_index(X_all, k=k)
+
+        y_all = np.concatenate([ytr, np.full((Xte_s.shape[0],), np.nan, dtype=np.float32)])
+        y_all_t = torch.tensor(np.nan_to_num(y_all, nan=0.0), dtype=torch.float32)
+
+        data_all = Data(
+            x=torch.tensor(X_all, dtype=torch.float32),
+            edge_index=edge_all,
+            y=y_all_t
+        )
+        train_mask = torch.zeros(X_all.shape[0], dtype=torch.bool)
+        train_mask[:Xtr_s.shape[0]] = True
+
+        model = train_gat(data_all, train_mask, epochs=epochs, lr=lr, weight_decay=weight_decay, seed=seed)
+
+        with torch.no_grad():
+            pred_all = model(data_all.x, data_all.edge_index).numpy()
+        pred_te = pred_all[Xtr_s.shape[0]:]
 
     out = pd.DataFrame({"ID": test["ID"].values, "yhat": pred_te})
     out.to_csv(out_path, index=False)
