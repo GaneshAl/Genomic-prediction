@@ -1,16 +1,21 @@
 #!/usr/bin/env Rscript
 # ==============================================================
-# Genomic Prediction Pipeline (Methods paper version)
+# Fully Nested CV Genomic Prediction Pipeline
 # rrBLUP + BayesB + RKHS + RF + SVR + GAT
-# + OOF predictions
-# + Mean ensemble + Ridge stacking
-# + Architecture ablation (meta-only, leave-one-out)
-# + Weight stability across CV reps
-# + Residual complementarity (residual correlation)
+#
+# Outer CV: unbiased performance estimate
+# Inner CV: generate OOF base predictions on outer-train set
+#           + fit ridge stacker (with cv.glmnet lambda selection)
+#
+# Outputs:
+# - metrics_overall_<trait>.tsv  (outer-CV aggregated)
+# - metrics_by_outer_<trait>.tsv (per outer fold)
+# - stacking_weights_<trait>.tsv (per outer fold weights)
+# - runtime_by_model_<trait>.tsv
 # ==============================================================
 
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) < 1) stop("Usage: Rscript run_driver.R <phenotype_file>\n")
+if (length(args) < 1) stop("Usage: Rscript run_driver_nested.R <phenotype_file>\n")
 pheno_file <- args[1]
 
 suppressPackageStartupMessages({
@@ -24,11 +29,12 @@ suppressPackageStartupMessages({
 TRAITS <- c("BC", "FF", "FW", "TSS", "TC")
 ID_COL <- "ID"
 
-K_FOLDS <- 5
+K_OUTER <- 5
+K_INNER <- 5
 N_REPS  <- 10
 set.seed(123)
 
-# BayesB iterations (final) - used by strict OOF BayesB fit
+# BayesB iterations
 BAYESB_nIter  <- 12000
 BAYESB_burnIn <- 4000
 BAYESB_thin   <- 5
@@ -39,14 +45,14 @@ RF_SCRIPT  <- "py_models/rf.py"
 SVR_SCRIPT <- "py_models/svr.py"
 GAT_SCRIPT <- "py_models/gat.py"
 
-dir.create("results", showWarnings = FALSE, recursive = TRUE)
+dir.create("results_nested", showWarnings = FALSE, recursive = TRUE)
 dir.create("tmp", showWarnings = FALSE, recursive = TRUE)
 
 # ---------------- SOURCE MODEL HELPERS ----------------
-source("models/rrblup.R")
-source("models/bayesb.R")
-source("models/rkhs.R")
-source("utils/call_python_model.R")
+source("models/rrblup.R")    # predict_fold_rrBLUP(...)
+source("models/bayesb.R")    # predict_fold_BayesB(...)
+source("models/rkhs.R")      # predict_fold_RKHS(...)
+source("utils/call_python_model.R")  # call_py_model(...)
 
 # ---------------- HELPERS ----------------
 safe_cor <- function(a, b) {
@@ -69,8 +75,8 @@ metrics_vec <- function(y_true, y_pred) {
 }
 
 fit_stack_ridge <- function(X, y) {
-  # X already OOF; scale predictors for stability.
-  # IMPORTANT: store train scaling and apply the SAME scaling at predict time.
+  # Fit ridge with internal CV on the *meta-training set only*
+  # Store scaling so predict uses identical transform.
   Xs <- scale(X)
   ctr <- attr(Xs, "scaled:center")
   scl <- attr(Xs, "scaled:scale")
@@ -85,37 +91,34 @@ fit_stack_ridge <- function(X, y) {
     cv = cv,
     lambda = cv$lambda.min,
     coef = as.matrix(coef(cv, s="lambda.min")),
-    predict = function(newX) as.numeric(predict(cv, scale_with(newX), s="lambda.min"))
+    predict = function(newX) as.numeric(predict(cv, scale_with(newX), s="lambda.min")),
+    scale_center = ctr,
+    scale_scale  = scl
   )
 }
 
-# Meta-only ablation: refit ridge leaving one column out
-ablate_stack <- function(oof_X, y, model_names) {
-  valid <- which(!is.na(y) & rowSums(is.na(oof_X)) == 0)
-  Xv <- oof_X[valid, , drop=FALSE]
-  yv <- y[valid]
+# Create fold labels for a given index vector
+make_folds <- function(idx, K) {
+  # returns integer labels 1..K for each element of idx
+  sample(rep(seq_len(K), length.out = length(idx)))
+}
 
-  out <- list()
+# Build train/test data.frames for python models from genotype matrix M and phenotype y
+make_py_train_test <- function(ids, M, y, train_idx, test_idx) {
+  train_df <- data.table(ID = ids[train_idx], y = y[train_idx])
+  test_df  <- data.table(ID = ids[test_idx])
 
-  # FULL
-  st_full <- fit_stack_ridge(Xv, yv)
-  yhat_full <- st_full$predict(Xv)
-  m_full <- metrics_vec(yv, yhat_full)
-  out[["FULL"]] <- list(metrics = m_full, weights = st_full$coef, lambda = st_full$lambda)
+  Xtr <- as.data.table(M[train_idx, , drop=FALSE])
+  Xte <- as.data.table(M[test_idx,  , drop=FALSE])
 
-  # Leave-one-out
-  for (m in model_names) {
-    keep <- setdiff(model_names, m)
-    st <- fit_stack_ridge(Xv[, keep, drop=FALSE], yv)
-    yhat <- st$predict(Xv[, keep, drop=FALSE])
-    met <- metrics_vec(yv, yhat)
-    out[[paste0("NO_", m)]] <- list(metrics = met, weights = st$coef, lambda = st$lambda, keep=keep)
-  }
-  out
+  train_df <- cbind(train_df, Xtr)
+  test_df  <- cbind(test_df,  Xte)
+
+  list(train_df=train_df, test_df=test_df)
 }
 
 # ---------------- READ GENOTYPES ----------------
-cat("Reading genotypes...\n")
+cat("Reading genotypes.\n")
 geno <- fread("GP_MARKERS.raw")
 ids <- geno$IID
 
@@ -128,281 +131,256 @@ rm(geno); gc()
 v <- apply(M, 2, var, na.rm = TRUE)
 M <- M[, v > 0, drop = FALSE]
 
-# Mean impute + center
+# Mean impute + center (global X-only preprocessing; strict alternative is foldwise)
 cm <- colMeans(M, na.rm = TRUE)
 for (j in seq_len(ncol(M))) {
-  idx <- is.na(M[, j])
-  if (any(idx)) M[idx, j] <- cm[j]
+  nas <- is.na(M[, j])
+  if (any(nas)) M[nas, j] <- cm[j]
 }
 M <- scale(M, center = TRUE, scale = FALSE)
-
-# ---------------- PRECOMPUTE RKHS DISTANCES ONCE (STRICT OOF) ----------------
-# Instead of precomputing a full kernel Kk (which is transductive if used inside BGLR),
-# we precompute squared distances D2 and let predict_fold_RKHS choose bandwidth using
-# TRAIN ONLY within each fold.
-cat("Precomputing squared distances for RKHS...\n")
-D  <- as.matrix(dist(M))
-D2 <- D^2
-rm(D); gc()
+M <- as.matrix(M)
 
 # ---------------- READ PHENOTYPES ----------------
-cat("Reading phenotypes...\n")
 pheno <- fread(pheno_file)
-pheno <- pheno[match(ids, pheno[[ID_COL]]), ]
-stopifnot(all(pheno[[ID_COL]] == ids))
+if (!(ID_COL %in% names(pheno))) stop("Phenotype file must have ID column: ", ID_COL)
 
-model_names <- c("rrBLUP","BayesB","RKHS","RF","SVR","GAT")
+# align phenotypes to genotype IDs
+setkeyv(pheno, ID_COL)
+pheno <- pheno[J(ids), nomatch=0]
+if (nrow(pheno) == 0) stop("No overlapping IDs between genotype and phenotype file.")
+pheno_ids <- pheno[[ID_COL]]
 
-# ---------------- TRAIT LOOP ----------------
+# reorder genotype matrix to match phenotype ordering
+ord <- match(pheno_ids, ids)
+ids <- ids[ord]
+M <- M[ord, , drop=FALSE]
+
+# ---------------- MAIN LOOP ----------------
+model_names <- c("rrBLUP", "BayesB", "RKHS", "RF", "SVR", "GAT")
+
 for (trait in TRAITS) {
+  cat("\n=== Trait:", trait, "===\n")
+  if (!(trait %in% names(pheno))) {
+    cat("Trait not found in phenotype file:", trait, " -- skipping\n")
+    next
+  }
 
-  cat("\n==============================\n")
-  cat("Trait:", trait, "\n")
-  cat("==============================\n")
-
-  outdir <- file.path("results", paste0("Trait_", trait))
-  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
-  dir.create(file.path(outdir,"oof"), showWarnings = FALSE, recursive = TRUE)
-  dir.create(file.path(outdir,"metrics"), showWarnings = FALSE, recursive = TRUE)
-  dir.create(file.path(outdir,"stacking"), showWarnings = FALSE, recursive = TRUE)
-  dir.create(file.path(outdir,"ablation"), showWarnings = FALSE, recursive = TRUE)
-  dir.create(file.path(outdir,"runtime"), showWarnings = FALSE, recursive = TRUE)
-  dir.create(file.path(outdir,"complementarity"), showWarnings = FALSE, recursive = TRUE)
-
-  y <- pheno[[trait]]
-  idx_nonNA <- which(!is.na(y))
+  y <- as.numeric(pheno[[trait]])
   n <- length(y)
 
-  preds_all <- array(
-    NA_real_,
-    dim = c(n, length(model_names), N_REPS),
-    dimnames = list(ids, model_names, paste0("rep", 1:N_REPS))
-  )
+  outdir <- file.path("results_nested", trait)
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "metrics"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "stacking"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "runtime"), showWarnings = FALSE, recursive = TRUE)
 
-  # runtime log: long table
-  runtime_log <- data.table(
-    Trait=character(), Rep=integer(), Fold=integer(),
-    Model=character(), Seconds=numeric()
-  )
-
-  # stacking weights per rep (weight stability)
-  weight_log <- data.table(
-    Trait=character(), Rep=integer(), Model=character(),
-    Weight=numeric(), Lambda=numeric()
-  )
-
-  # rep-wise metrics for base and ensembles
-  metrics_rep <- data.table(
-    Trait=character(), Rep=integer(), Model=character(),
+  metrics_outer <- data.table(
+    Trait=character(), Rep=integer(), OuterFold=integer(), Model=character(),
     r=numeric(), spearman=numeric(), rmse=numeric(), mae=numeric()
   )
+  weight_log <- data.table(
+    Trait=character(), Rep=integer(), OuterFold=integer(),
+    Term=character(), Coef=numeric(), Lambda=numeric()
+  )
+  runtime_log <- data.table(Trait=character(), Rep=integer(), OuterFold=integer(),
+                            Phase=character(), Model=character(), Seconds=numeric())
 
-  # -------------- CV repeats --------------
+  # ---------- Repeated OUTER CV ----------
+  idx_nonNA <- which(!is.na(y))
   for (rep in seq_len(N_REPS)) {
+    folds_outer <- make_folds(idx_nonNA, K_OUTER)
 
-    cat("  CV repeat", rep, "\n")
+    for (k_out in seq_len(K_OUTER)) {
+      t_outer0 <- proc.time()[3]
 
-    folds <- sample(rep(1:K_FOLDS, length.out = length(idx_nonNA)))
+      test_idx_outer  <- idx_nonNA[folds_outer == k_out]
+      train_idx_outer <- setdiff(idx_nonNA, test_idx_outer)
 
-    for (k in seq_len(K_FOLDS)) {
+      # ---------- INNER CV on OUTER-TRAIN to create meta-training OOF ----------
+      t_inner0 <- proc.time()[3]
 
-      test_idx  <- idx_nonNA[folds == k]
-      train_idx <- setdiff(idx_nonNA, test_idx)
+      folds_inner <- make_folds(train_idx_outer, K_INNER)
 
-      # Prepare fold dataframes for python models (use centered M)
-      train_df <- data.frame(ID = ids[train_idx], y = y[train_idx], M[train_idx, , drop=FALSE])
-      test_df  <- data.frame(ID = ids[test_idx],  M[test_idx,  , drop=FALSE])
+      # inner OOF preds for meta-training (rows=train_idx_outer only)
+      oof_inner <- matrix(NA_real_, nrow=n, ncol=length(model_names),
+                          dimnames=list(ids, model_names))
 
-      # -------- rrBLUP --------
+      for (k_in in seq_len(K_INNER)) {
+        val_idx_inner <- train_idx_outer[folds_inner == k_in]
+        fit_idx_inner <- setdiff(train_idx_outer, val_idx_inner)
+
+        # rrBLUP
+        t0 <- proc.time()[3]
+        oof_inner[val_idx_inner, "rrBLUP"] <- predict_fold_rrBLUP(y, M, fit_idx_inner, val_idx_inner)
+        runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="INNER", Model="rrBLUP", Seconds=proc.time()[3]-t0))
+
+        # BayesB
+        t0 <- proc.time()[3]
+        oof_inner[val_idx_inner, "BayesB"] <- predict_fold_BayesB(y, M, fit_idx_inner, val_idx_inner,
+                                                                 nIter=BAYESB_nIter, burnIn=BAYESB_burnIn, thin=BAYESB_thin)
+        runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="INNER", Model="BayesB", Seconds=proc.time()[3]-t0))
+
+        # RKHS
+        t0 <- proc.time()[3]
+        oof_inner[val_idx_inner, "RKHS"] <- predict_fold_RKHS(y, M, fit_idx_inner, val_idx_inner)
+        runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="INNER", Model="RKHS", Seconds=proc.time()[3]-t0))
+
+        # Python models: RF / SVR / GAT
+        # Build fold-specific train/test dfs
+        py <- make_py_train_test(ids, M, y, fit_idx_inner, val_idx_inner)
+
+        # RF
+        t0 <- proc.time()[3]
+        rf_out <- file.path("tmp", sprintf("pred_RF_%s_rep%02d_out%02d_in%02d.csv", trait, rep, k_out, k_in))
+        pred_rf <- call_py_model(RF_SCRIPT, py$train_df, py$test_df, rf_out, python=PYTHON,
+                                tag=sprintf("RF_%s_rep%02d_out%02d_in%02d", trait, rep, k_out, k_in))
+        oof_inner[val_idx_inner, "RF"] <- pred_rf$yhat[match(ids[val_idx_inner], pred_rf$ID)]
+        runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="INNER", Model="RF", Seconds=proc.time()[3]-t0))
+
+        # SVR
+        t0 <- proc.time()[3]
+        svr_out <- file.path("tmp", sprintf("pred_SVR_%s_rep%02d_out%02d_in%02d.csv", trait, rep, k_out, k_in))
+        pred_svr <- call_py_model(SVR_SCRIPT, py$train_df, py$test_df, svr_out, python=PYTHON,
+                                 tag=sprintf("SVR_%s_rep%02d_out%02d_in%02d", trait, rep, k_out, k_in))
+        oof_inner[val_idx_inner, "SVR"] <- pred_svr$yhat[match(ids[val_idx_inner], pred_svr$ID)]
+        runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="INNER", Model="SVR", Seconds=proc.time()[3]-t0))
+
+        # GAT
+        t0 <- proc.time()[3]
+        gat_out <- file.path("tmp", sprintf("pred_GAT_%s_rep%02d_out%02d_in%02d.csv", trait, rep, k_out, k_in))
+        pred_gat <- call_py_model(GAT_SCRIPT, py$train_df, py$test_df, gat_out, python=PYTHON,
+                                 tag=sprintf("GAT_%s_rep%02d_out%02d_in%02d", trait, rep, k_out, k_in))
+        oof_inner[val_idx_inner, "GAT"] <- pred_gat$yhat[match(ids[val_idx_inner], pred_gat$ID)]
+        runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="INNER", Model="GAT", Seconds=proc.time()[3]-t0))
+      }
+
+      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="INNER", Model="ALL", Seconds=proc.time()[3]-t_inner0))
+
+      # Fit meta-learner on inner-OOF predictions (outer-train only)
+      meta_train_rows <- train_idx_outer
+      meta_ok <- meta_train_rows[rowSums(is.na(oof_inner[meta_train_rows, , drop=FALSE])) == 0]
+      meta_ok <- meta_ok[!is.na(y[meta_ok])]
+
+      if (length(meta_ok) < 5) {
+        warning(sprintf("[%s rep%02d fold%02d] Not enough complete meta rows for stacking; skipping stacking.", trait, rep, k_out))
+        stacker <- NULL
+      } else {
+        stacker <- fit_stack_ridge(oof_inner[meta_ok, , drop=FALSE], y[meta_ok])
+
+        # log weights
+        cf <- stacker$coef
+        for (i in seq_len(nrow(cf))) {
+          weight_log <- rbind(weight_log, data.table(
+            Trait=trait, Rep=rep, OuterFold=k_out,
+            Term=rownames(cf)[i], Coef=as.numeric(cf[i,1]), Lambda=stacker$lambda
+          ))
+        }
+      }
+
+      # ---------- Refit base models on full OUTER-TRAIN; predict OUTER-TEST ----------
+      # base predictions on outer test
+      base_te <- matrix(NA_real_, nrow=length(test_idx_outer), ncol=length(model_names),
+                        dimnames=list(ids[test_idx_outer], model_names))
+
+      # rrBLUP
       t0 <- proc.time()[3]
-      preds_all[test_idx, "rrBLUP", rep] <- predict_fold_rrBLUP(y, M, train_idx, test_idx)
-      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, Fold=k, Model="rrBLUP", Seconds=proc.time()[3]-t0))
+      base_te[, "rrBLUP"] <- predict_fold_rrBLUP(y, M, train_idx_outer, test_idx_outer)
+      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="OUTER_TRAIN", Model="rrBLUP", Seconds=proc.time()[3]-t0))
 
-      # -------- BayesB (STRICT OOF assumed in models/bayesb.R) --------
+      # BayesB
       t0 <- proc.time()[3]
-      preds_all[test_idx, "BayesB", rep] <- predict_fold_BayesB(
-        y, M, train_idx, test_idx,
-        nIter=BAYESB_nIter, burnIn=BAYESB_burnIn, thin=BAYESB_thin
-      )
-      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, Fold=k, Model="BayesB", Seconds=proc.time()[3]-t0))
+      base_te[, "BayesB"] <- predict_fold_BayesB(y, M, train_idx_outer, test_idx_outer,
+                                                nIter=BAYESB_nIter, burnIn=BAYESB_burnIn, thin=BAYESB_thin)
+      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="OUTER_TRAIN", Model="BayesB", Seconds=proc.time()[3]-t0))
 
-      # -------- RKHS (STRICT OOF via D2; assumed in models/rkhs.R) --------
+      # RKHS
       t0 <- proc.time()[3]
-      preds_all[test_idx, "RKHS", rep] <- predict_fold_RKHS(
-        y, D2, train_idx, test_idx
-      )
-      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, Fold=k, Model="RKHS", Seconds=proc.time()[3]-t0))
+      base_te[, "RKHS"] <- predict_fold_RKHS(y, M, train_idx_outer, test_idx_outer)
+      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="OUTER_TRAIN", Model="RKHS", Seconds=proc.time()[3]-t0))
 
-      # -------- RF (python) --------
+      # Python models on full outer train
+      py_outer <- make_py_train_test(ids, M, y, train_idx_outer, test_idx_outer)
+
+      # RF
       t0 <- proc.time()[3]
-      rf_out <- file.path("tmp", sprintf("pred_rf_%s_rep%02d_fold%02d.csv", trait, rep, k))
-      pred_rf <- call_py_model(
-        RF_SCRIPT, train_df, test_df,
-        out_pred = rf_out,
-        python   = PYTHON,
-        tag      = sprintf("RF_%s_rep%02d_fold%02d", trait, rep, k)
-      )
-      preds_all[test_idx, "RF", rep] <- pred_rf$yhat[match(ids[test_idx], pred_rf$ID)]
-      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, Fold=k, Model="RF", Seconds=proc.time()[3]-t0))
+      rf_out <- file.path("tmp", sprintf("pred_RF_%s_rep%02d_out%02d_TEST.csv", trait, rep, k_out))
+      pred_rf <- call_py_model(RF_SCRIPT, py_outer$train_df, py_outer$test_df, rf_out, python=PYTHON,
+                              tag=sprintf("RF_%s_rep%02d_out%02d_TEST", trait, rep, k_out))
+      base_te[, "RF"] <- pred_rf$yhat[match(ids[test_idx_outer], pred_rf$ID)]
+      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="OUTER_TRAIN", Model="RF", Seconds=proc.time()[3]-t0))
 
-      # -------- SVR (python) --------
+      # SVR
       t0 <- proc.time()[3]
-      svr_out <- file.path("tmp", sprintf("pred_svr_%s_rep%02d_fold%02d.csv", trait, rep, k))
-      pred_svr <- call_py_model(
-        SVR_SCRIPT, train_df, test_df,
-        out_pred = svr_out,
-        python   = PYTHON,
-        tag      = sprintf("SVR_%s_rep%02d_fold%02d", trait, rep, k)
-      )
-      preds_all[test_idx, "SVR", rep] <- pred_svr$yhat[match(ids[test_idx], pred_svr$ID)]
-      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, Fold=k, Model="SVR", Seconds=proc.time()[3]-t0))
+      svr_out <- file.path("tmp", sprintf("pred_SVR_%s_rep%02d_out%02d_TEST.csv", trait, rep, k_out))
+      pred_svr <- call_py_model(SVR_SCRIPT, py_outer$train_df, py_outer$test_df, svr_out, python=PYTHON,
+                               tag=sprintf("SVR_%s_rep%02d_out%02d_TEST", trait, rep, k_out))
+      base_te[, "SVR"] <- pred_svr$yhat[match(ids[test_idx_outer], pred_svr$ID)]
+      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="OUTER_TRAIN", Model="SVR", Seconds=proc.time()[3]-t0))
 
-      # -------- GAT (python) --------
+      # GAT
       t0 <- proc.time()[3]
-      gat_out <- file.path("tmp", sprintf("pred_gat_%s_rep%02d_fold%02d.csv", trait, rep, k))
-      pred_gat <- call_py_model(
-        GAT_SCRIPT, train_df, test_df,
-        out_pred = gat_out,
-        python   = PYTHON,
-        tag      = sprintf("GAT_%s_rep%02d_fold%02d", trait, rep, k)
-      )
-      preds_all[test_idx, "GAT", rep] <- pred_gat$yhat[match(ids[test_idx], pred_gat$ID)]
-      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, Fold=k, Model="GAT", Seconds=proc.time()[3]-t0))
-    }
+      gat_out <- file.path("tmp", sprintf("pred_GAT_%s_rep%02d_out%02d_TEST.csv", trait, rep, k_out))
+      pred_gat <- call_py_model(GAT_SCRIPT, py_outer$train_df, py_outer$test_df, gat_out, python=PYTHON,
+                               tag=sprintf("GAT_%s_rep%02d_out%02d_TEST", trait, rep, k_out))
+      base_te[, "GAT"] <- pred_gat$yhat[match(ids[test_idx_outer], pred_gat$ID)]
+      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="OUTER_TRAIN", Model="GAT", Seconds=proc.time()[3]-t0))
 
-    # ---------- Rep-wise evaluation (base + ensembles + stacking weights) ----------
-    # Base predictions for this rep
-    oof_rep <- preds_all[, , rep, drop=FALSE][,,1]
-    valid <- which(!is.na(y) & rowSums(is.na(oof_rep)) == 0)
+      # ---------- Evaluate on OUTER TEST ----------
+      y_te <- y[test_idx_outer]
 
-    # Base model metrics
-    for (m in model_names) {
-      met <- metrics_vec(y[valid], oof_rep[valid, m])
-      metrics_rep <- rbind(metrics_rep, data.table(
-        Trait=trait, Rep=rep, Model=m,
-        r=met$r, spearman=met$spearman, rmse=met$rmse, mae=met$mae
+      # Base models
+      for (m in model_names) {
+        met <- metrics_vec(y_te, base_te[, m])
+        metrics_outer <- rbind(metrics_outer, data.table(
+          Trait=trait, Rep=rep, OuterFold=k_out, Model=m,
+          r=met$r, spearman=met$spearman, rmse=met$rmse, mae=met$mae
+        ))
+      }
+
+      # Mean ensemble
+      yhat_mean <- rowMeans(base_te, na.rm = FALSE)
+      met_mean <- metrics_vec(y_te, yhat_mean)
+      metrics_outer <- rbind(metrics_outer, data.table(
+        Trait=trait, Rep=rep, OuterFold=k_out, Model="MeanEnsemble",
+        r=met_mean$r, spearman=met_mean$spearman, rmse=met_mean$rmse, mae=met_mean$mae
       ))
+
+      # Stacking
+      if (!is.null(stacker)) {
+        # stacker trained on inner-OOF; now apply to base predictions on outer test
+        yhat_stack <- stacker$predict(base_te)
+        met_stack <- metrics_vec(y_te, yhat_stack)
+        metrics_outer <- rbind(metrics_outer, data.table(
+          Trait=trait, Rep=rep, OuterFold=k_out, Model="Stacking",
+          r=met_stack$r, spearman=met_stack$spearman, rmse=met_stack$rmse, mae=met_stack$mae
+        ))
+      } else {
+        metrics_outer <- rbind(metrics_outer, data.table(
+          Trait=trait, Rep=rep, OuterFold=k_out, Model="Stacking",
+          r=NA_real_, spearman=NA_real_, rmse=NA_real_, mae=NA_real_
+        ))
+      }
+
+      runtime_log <- rbind(runtime_log, data.table(Trait=trait, Rep=rep, OuterFold=k_out, Phase="OUTER_TOTAL", Model="ALL", Seconds=proc.time()[3]-t_outer0))
     }
-
-    # Mean ensemble metrics
-    yhat_mean <- rowMeans(oof_rep[valid, , drop=FALSE])
-    met_mean <- metrics_vec(y[valid], yhat_mean)
-    metrics_rep <- rbind(metrics_rep, data.table(
-      Trait=trait, Rep=rep, Model="MeanEnsemble",
-      r=met_mean$r, spearman=met_mean$spearman, rmse=met_mean$rmse, mae=met_mean$mae
-    ))
-
-    # Ridge stacking (per rep) + weight log
-    st <- fit_stack_ridge(oof_rep[valid, , drop=FALSE], y[valid])
-    yhat_stack <- st$predict(oof_rep[valid, , drop=FALSE])
-    met_stack <- metrics_vec(y[valid], yhat_stack)
-    metrics_rep <- rbind(metrics_rep, data.table(
-      Trait=trait, Rep=rep, Model="Stacking",
-      r=met_stack$r, spearman=met_stack$spearman, rmse=met_stack$rmse, mae=met_stack$mae
-    ))
-
-    # Store weights (exclude intercept row 1)
-    coef_vec <- st$coef
-    rn <- rownames(coef_vec)
-    for (i in seq_along(rn)) {
-      if (rn[i] == "(Intercept)") next
-      weight_log <- rbind(weight_log, data.table(
-        Trait=trait, Rep=rep, Model=rn[i],
-        Weight=as.numeric(coef_vec[i,1]),
-        Lambda=st$lambda
-      ))
-    }
-  } # end reps
-
-  # -------------- Aggregate OOF across reps (your original logic) --------------
-  oof_mean <- apply(preds_all, c(1,2), mean, na.rm = TRUE)
-
-  saveRDS(preds_all,  file.path(outdir,"oof", paste0("OOF_full_", trait, ".rds")))
-  saveRDS(oof_mean,   file.path(outdir,"oof", paste0("OOF_mean_", trait, ".rds")))
-  saveRDS(list(ids=ids, y=y), file.path(outdir,"oof", paste0("y_ids_", trait, ".rds")))
-
-  # -------------- Overall metrics using OOF_mean --------------
-  valid_all <- which(!is.na(y) & rowSums(is.na(oof_mean)) == 0)
-
-  metrics_overall <- data.table(Trait=trait, Model=character(), r=numeric(), spearman=numeric(), rmse=numeric(), mae=numeric())
-  for (m in model_names) {
-    met <- metrics_vec(y[valid_all], oof_mean[valid_all, m])
-    metrics_overall <- rbind(metrics_overall, data.table(Trait=trait, Model=m, r=met$r, spearman=met$spearman, rmse=met$rmse, mae=met$mae))
   }
 
-  # Mean ensemble on OOF_mean
-  yhat_mean_all <- rowMeans(oof_mean[valid_all, , drop=FALSE])
-  met_mean_all <- metrics_vec(y[valid_all], yhat_mean_all)
-  metrics_overall <- rbind(metrics_overall, data.table(Trait=trait, Model="MeanEnsemble", r=met_mean_all$r, spearman=met_mean_all$spearman, rmse=met_mean_all$rmse, mae=met_mean_all$mae))
-
-  # Stacking on OOF_mean
-  st_all <- fit_stack_ridge(oof_mean[valid_all, , drop=FALSE], y[valid_all])
-  yhat_stack_all <- st_all$predict(oof_mean[valid_all, , drop=FALSE])
-  met_stack_all <- metrics_vec(y[valid_all], yhat_stack_all)
-  metrics_overall <- rbind(metrics_overall, data.table(Trait=trait, Model="Stacking", r=met_stack_all$r, spearman=met_stack_all$spearman, rmse=met_stack_all$rmse, mae=met_stack_all$mae))
-
-  fwrite(metrics_overall, file.path(outdir,"metrics", paste0("metrics_overall_", trait, ".tsv")), sep="\t")
-  fwrite(metrics_rep,     file.path(outdir,"metrics", paste0("metrics_by_rep_", trait, ".tsv")), sep="\t")
-  fwrite(runtime_log,     file.path(outdir,"runtime", paste0("runtime_by_model_", trait, ".tsv")), sep="\t")
-  fwrite(weight_log,      file.path(outdir,"stacking", paste0("stacking_weights_by_rep_", trait, ".tsv")), sep="\t")
-
-  # -------------- Weight stability summary --------------
-  # mean/sd/CV + top-1 frequency
-  wsum <- weight_log[, .(
-    mean_w = mean(Weight, na.rm=TRUE),
-    sd_w   = sd(Weight, na.rm=TRUE),
-    cv_w   = ifelse(abs(mean(Weight, na.rm=TRUE)) < 1e-12, NA_real_, sd(Weight, na.rm=TRUE)/abs(mean(Weight, na.rm=TRUE))),
-    q025 = quantile(Weight, 0.025, na.rm=TRUE),
-    q975 = quantile(Weight, 0.975, na.rm=TRUE)
+  # ---------- Aggregate outer-CV results ----------
+  # mean over (Rep, OuterFold) per model
+  metrics_overall <- metrics_outer[, .(
+    r       = mean(r, na.rm=TRUE),
+    spearman= mean(spearman, na.rm=TRUE),
+    rmse    = mean(rmse, na.rm=TRUE),
+    mae     = mean(mae, na.rm=TRUE)
   ), by=.(Trait, Model)]
 
-  # top-1 frequency per trait
-  top1 <- weight_log[, .SD[which.max(Weight)], by=.(Trait, Rep)]
-  top1_freq <- top1[, .(top1_freq = .N / N_REPS), by=.(Trait, Model)]
-  wstab <- merge(wsum, top1_freq, by=c("Trait","Model"), all.x=TRUE)
-  fwrite(wstab, file.path(outdir,"stacking", paste0("weight_stability_", trait, ".tsv")), sep="\t")
+  fwrite(metrics_overall, file.path(outdir, "metrics", paste0("metrics_overall_", trait, ".tsv")), sep="\t")
+  fwrite(metrics_outer,   file.path(outdir, "metrics", paste0("metrics_by_outer_", trait, ".tsv")), sep="\t")
+  fwrite(weight_log,      file.path(outdir, "stacking", paste0("stacking_weights_", trait, ".tsv")), sep="\t")
+  fwrite(runtime_log,     file.path(outdir, "runtime", paste0("runtime_by_model_", trait, ".tsv")), sep="\t")
 
-  # -------------- Architecture ablation (meta-only) --------------
-  abl <- ablate_stack(oof_mean, y, model_names)
-  ablation_tbl <- data.table(
-    Trait=trait, Condition=character(),
-    r=numeric(), spearman=numeric(), rmse=numeric(), mae=numeric(),
-    delta_r=numeric(), delta_rmse=numeric(), delta_mae=numeric()
-  )
-
-  full_m <- abl[["FULL"]]$metrics
-  for (cond in names(abl)) {
-    met <- abl[[cond]]$metrics
-    ablation_tbl <- rbind(ablation_tbl, data.table(
-      Trait=trait, Condition=cond,
-      r=met$r, spearman=met$spearman, rmse=met$rmse, mae=met$mae,
-      delta_r = full_m$r - met$r,
-      delta_rmse = met$rmse - full_m$rmse,
-      delta_mae  = met$mae  - full_m$mae
-    ))
-  }
-  fwrite(ablation_tbl, file.path(outdir,"ablation", paste0("ablation_meta_only_", trait, ".tsv")), sep="\t")
-
-  # -------------- Residual complementarity (OOF_mean residual correlations) --------------
-  # residuals = y - yhat_model (valid rows only)
-  Rmat <- matrix(NA_real_, nrow=length(model_names), ncol=length(model_names),
-                 dimnames=list(model_names, model_names))
-  resid_mat <- sapply(model_names, function(m) y[valid_all] - oof_mean[valid_all, m])
-  for (i in seq_along(model_names)) {
-    for (j in seq_along(model_names)) {
-      Rmat[i,j] <- safe_cor(resid_mat[,i], resid_mat[,j])
-    }
-  }
-  saveRDS(Rmat, file.path(outdir,"complementarity", paste0("residual_corr_", trait, ".rds")))
-  fwrite(as.data.table(Rmat, keep.rownames="Model"),
-         file.path(outdir,"complementarity", paste0("residual_corr_", trait, ".tsv")), sep="\t")
-
-  # -------------- Save overall stacking weights on OOF_mean --------------
-  coef_all <- st_all$coef
-  coef_dt <- data.table(Trait=trait, Term=rownames(coef_all), Coef=as.numeric(coef_all[,1]), Lambda=st_all$lambda)
-  fwrite(coef_dt, file.path(outdir,"stacking", paste0("stacking_coef_overall_", trait, ".tsv")), sep="\t")
-
-  cat("[", trait, "] finished\n", sep="")
+  cat("[", trait, "] finished (nested CV)\n", sep="")
 }
 
-cat("\n=== PIPELINE FINISHED SUCCESSFULLY ===\n")
+cat("\n=== NESTED PIPELINE FINISHED SUCCESSFULLY ===\n")
+
