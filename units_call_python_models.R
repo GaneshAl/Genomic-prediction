@@ -2,9 +2,13 @@ suppressPackageStartupMessages({
   library(data.table)
 })
 
+# Robust Python wrapper for fold-wise model calls.
+# Allows optional extra args and environment variables (used for GAT ablations).
 call_py_model <- function(script, train_df, test_df, out_pred,
                           python = "python",
-                          tag = NULL) {
+                          tag = NULL,
+                          extra_args = character(0),
+                          env = character(0)) {
   dir.create("tmp", showWarnings = FALSE, recursive = TRUE)
 
   # unique, collision-free temp files
@@ -17,21 +21,24 @@ call_py_model <- function(script, train_df, test_df, out_pred,
   fwrite(train_df, train_path)
   fwrite(test_df,  test_path)
 
-  # robust invocation
-  # args: script train test out_pred
+  # Build command
+  args <- c(script, train_path, test_path, out_pred, extra_args)
+
+  # Run with optional env vars (NAME=VALUE strings)
   res <- tryCatch(
-    system2(python, args = c(script, train_path, test_path, out_pred),
-            stdout = TRUE, stderr = TRUE),
+    system2(python,
+            args = args,
+            stdout = TRUE,
+            stderr = TRUE,
+            env = env),
     error = function(e) e
   )
   if (inherits(res, "error")) {
     stop("Python model call failed (R error): ", conditionMessage(res))
   }
-  # system2 doesn't directly give exit status when stdout/stderr captured like this,
-  # so we do a simple existence check:
   if (!file.exists(out_pred)) {
-    stop("Python model failed to write output: ", out_pred, "\nLast output:\n",
-         paste(tail(res, 50), collapse = "\n"))
+    stop("Python model failed to write output: ", out_pred,
+         "\nLast output:\n", paste(tail(res, 50), collapse = "\n"))
   }
 
   pred <- fread(out_pred)
